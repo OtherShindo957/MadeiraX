@@ -42,7 +42,8 @@ def _thin(data: bytes, offset: int = 0, length: int | None = None) -> dict:
     _require(count <= 100000 and size <= length - 32 and count <= size // 8, "invalid load-command table")
     result = {"architecture": CPU_NAMES.get(cpu, f"unknown ({cpu:#x})"), "cpu_subtype": subtype,
               "file_type": filetype, "platform": None, "minimum_os": None, "sdk": None,
-              "dependencies": [], "rpaths": [], "segments": [], "features": [], "unknown_commands": []}
+              "dependencies": [], "rpaths": [], "segments": [], "features": [], "unknown_commands": [],
+              "entry": None, "linkedit": {}, "dyld_info": None}
     position = offset + 32
     end = position + size
     for _ in range(count):
@@ -75,10 +76,45 @@ def _thin(data: bytes, offset: int = 0, length: int | None = None) -> dict:
             _require(cmdsize >= 72, "truncated segment command")
             name = block[8:24].split(b"\0", 1)[0].decode("utf-8", "replace")
             vmaddr, vmsize, fileoff, filesize = struct.unpack_from(endian + "4Q", block, 24)
-            nsects = struct.unpack_from(endian + "I", block, 64)[0]
+            maxprot, initprot, nsects, segflags = struct.unpack_from(endian + "4I", block, 56)
             _require(nsects <= (cmdsize - 72) // 80, "truncated section table")
             _require(fileoff <= length and filesize <= length - fileoff, "segment exceeds Mach-O slice")
-            result["segments"].append({"name": name, "vmaddr": vmaddr, "vmsize": vmsize, "fileoff": fileoff, "filesize": filesize})
+            _require(filesize <= vmsize and vmaddr + vmsize <= 1 << 64, "invalid segment VM size")
+            sections = []
+            for si in range(nsects):
+                so = 72 + si * 80
+                section = block[so:so + 16].split(b"\0", 1)[0].decode("utf-8", "replace")
+                section_segment = block[so + 16:so + 32].split(b"\0", 1)[0].decode("utf-8", "replace")
+                addr, secsize, secfileoff, align, reloff, nreloc, secflags = struct.unpack_from(endian + "2Q5I", block, so + 32)
+                _require(section_segment == name, "section segment name mismatch")
+                _require(addr >= vmaddr and secsize <= vmaddr + vmsize - addr, "section outside segment VM range")
+                zerofill = secflags & 0xFF in (1, 0xC, 0x12)
+                if not zerofill:
+                    _require(secfileoff >= fileoff and secsize <= fileoff + filesize - secfileoff, "section outside file-backed segment")
+                sections.append({"name": section, "addr": addr, "size": secsize, "offset": secfileoff, "flags": secflags, "zerofill": zerofill})
+            result["segments"].append({"name": name, "vmaddr": vmaddr, "vmsize": vmsize, "fileoff": fileoff, "filesize": filesize,
+                                       "maxprot": maxprot, "initprot": initprot, "flags": segflags, "sections": sections})
+        elif cmd == 0x80000028:  # LC_MAIN
+            _require(cmdsize >= 24 and result["entry"] is None, "invalid or duplicate LC_MAIN")
+            entryoff, stacksize = struct.unpack_from(endian + "2Q", block, 8)
+            result["entry"] = {"kind": "LC_MAIN", "entryoff": entryoff, "stacksize": stacksize}
+        elif cmd in (0x80000033, 0x80000034):
+            _require(cmdsize >= 16, "truncated linkedit command")
+            dataoff, datasize = struct.unpack_from(endian + "2I", block, 8)
+            _require(dataoff <= length and datasize <= length - dataoff, "linkedit data outside file")
+            key = "exports" if cmd == 0x80000033 else "chained_fixups"
+            _require(key not in result["linkedit"], "duplicate linkedit command")
+            result["linkedit"][key] = {"offset": dataoff, "size": datasize}
+            result["features"].append(key)
+        elif cmd in (0x22, 0x80000022):  # LC_DYLD_INFO(_ONLY)
+            _require(cmdsize >= 48, "truncated dyld info")
+            pairs = struct.unpack_from(endian + "10I", block, 8)
+            names = ("rebase", "bind", "weak_bind", "lazy_bind", "export")
+            info = dict(zip(names, ({"offset": pairs[i], "size": pairs[i + 1]} for i in range(0, 10, 2))))
+            for value in info.values():
+                _require(value["offset"] <= length and value["size"] <= length - value["offset"], "dyld info outside file")
+            result["dyld_info"] = info
+            result["features"].append("dyld_info")
         elif cmd in (0x80000034, 0x80000033, 0x80000022, 0x2, 0x1B, 0x1D, 0x80000028, 0x26):
             result["features"].append({0x80000034: "chained_fixups", 0x80000033: "exports_trie", 0x80000022: "dyld_info", 0x2: "symtab", 0x1B: "uuid", 0x1D: "code_signature", 0x80000028: "main", 0x26: "function_starts"}[cmd])
         else:
